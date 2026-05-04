@@ -1,0 +1,431 @@
+项目A运行说明
+
+当前代码已经包含：
+
+1. 数据预处理
+2. Prompt 构造
+3. MLLM 推理入口
+4. vLLM OpenAI-compatible API 调用
+5. HuggingFace Qwen2.5-VL debug 推理
+6. mock 后端无 GPU 调试
+7. 手写答案解析、归一化、匹配和 Accuracy
+8. verifier 数据构造、训练和 best-of-N rerank 入口
+
+
+一、安装依赖
+
+建议在 Linux / WSL / GPU 服务器上运行真实模型：
+
+pip install -r requirements.txt
+
+如果只是测试 mock 流程，可以暂时不安装 vLLM。
+
+
+二、先跑通 mock demo
+
+python scripts/run_inference.py ^
+  --input data/samples/tiny_mathvision_like.jsonl ^
+  --output outputs/predictions/tiny_predictions.jsonl ^
+  --batch-size 1
+
+python scripts/run_eval.py ^
+  --predictions outputs/predictions/tiny_predictions.jsonl ^
+  --report outputs/eval_reports/tiny_report.json ^
+  --bad-cases outputs/eval_reports/tiny_bad_cases.jsonl
+
+默认 configs/model.yaml 中 backend 是 mock，所以这一步不需要 GPU。
+
+
+三、准备真实数据
+
+本项目统一使用 JSONL 格式，每条样本建议包含：
+
+{
+  "id": "sample_id",
+  "question": "question text",
+  "choices": ["choice A", "choice B"],
+  "answer": "ground truth answer",
+  "image_path": "path/to/image.png",
+  "dataset": "mathvision"
+}
+
+如果原始数据字段名不同，代码会尝试自动识别常见字段：
+
+- question / problem / query / prompt / text
+- answer / gt / ground_truth / label / final_answer
+- image_path / image / image_file / img / picture
+- choices / options / candidates
+
+也可以使用 prepare_data.py 转换成本项目统一格式。
+
+如果直接使用项目A要求的数据集，建议使用专用脚本：
+
+准备 MathVision-testmini：
+
+python scripts/prepare_real_datasets.py ^
+  --dataset mathvision_testmini ^
+  --output data/processed/mathvision_testmini.jsonl
+
+准备完整 MathVision test：
+
+python scripts/prepare_real_datasets.py ^
+  --dataset mathvision_test ^
+  --output data/processed/mathvision_test.jsonl
+
+准备 V*Bench：
+
+python scripts/prepare_real_datasets.py ^
+  --dataset vstar_bench ^
+  --output data/processed/vstar_bench.jsonl
+
+小样本调试可以加 --limit 5，例如：
+
+python scripts/prepare_real_datasets.py ^
+  --dataset mathvision_testmini ^
+  --limit 5 ^
+  --output data/processed/mathvision_testmini_5.jsonl
+
+字段适配说明：
+
+MathVision-testmini:
+- HuggingFace 数据集：MathLLMs/MathVision
+- split：testmini
+- 原始字段：id、question、options、decoded_image、answer、level、subject
+- 本项目会把 decoded_image 保存到 data/raw/mathvision/images/
+
+V*Bench:
+- HuggingFace 数据集：craigwu/vstar_bench
+- split：test
+- 原始字段：image、text、category、question_id、label
+- 本项目会解析 text 里的 (A)/(B)/(C)/(D)，并把图片复制到 data/raw/vstar_bench/
+
+
+四、使用 HuggingFace 跑小样本 debug
+
+把 configs/model.yaml 改为：
+
+model:
+  name: Qwen/Qwen2.5-VL-3B-Instruct
+  backend: hf
+
+然后运行：
+
+python scripts/run_inference.py ^
+  --input data/processed/mathvision_testmini.jsonl ^
+  --output outputs/predictions/mathvision_predictions.jsonl ^
+  --limit 5
+
+
+五、使用 vLLM 跑正式推理
+
+先启动 vLLM 服务，例如：
+
+vllm serve Qwen/Qwen2.5-VL-3B-Instruct ^
+  --host 0.0.0.0 ^
+  --port 8000 ^
+  --limit-mm-per-prompt "{\"image\":1,\"video\":0}"
+
+然后把 configs/model.yaml 改为：
+
+model:
+  name: Qwen/Qwen2.5-VL-3B-Instruct
+  backend: vllm
+  api_base: http://localhost:8000/v1
+  api_key: EMPTY
+
+再运行：
+
+python scripts/run_inference.py ^
+  --input data/processed/mathvision_testmini.jsonl ^
+  --output outputs/predictions/mathvision_predictions.jsonl ^
+  --batch-size 1
+
+python scripts/run_eval.py ^
+  --predictions outputs/predictions/mathvision_predictions.jsonl ^
+  --report outputs/eval_reports/mathvision_report.json ^
+  --bad-cases outputs/eval_reports/mathvision_bad_cases.jsonl
+
+
+六、verifier 进阶路线
+
+先确保 predictions 已经过 run_eval.py，里面有 parsed_answer 和 is_correct。
+
+构造 verifier 训练数据：
+
+python scripts/build_verifier_data.py ^
+  --predictions outputs/predictions/mathvision_predictions.jsonl ^
+  --train-output outputs/verifier/verifier_train.jsonl ^
+  --valid-output outputs/verifier/verifier_valid.jsonl
+
+训练轻量 answer-level verifier：
+
+python scripts/train_verifier.py --config configs/verifier.yaml
+
+用 verifier 对 best-of-N 候选答案进行 rerank：
+
+python scripts/score_with_verifier.py ^
+  --candidates outputs/predictions/mathvision_best_of_n_candidates.jsonl ^
+  --verifier-dir outputs/verifier/checkpoints ^
+  --output outputs/verifier/verifier_selected_predictions.jsonl ^
+  --report outputs/verifier/verifier_selected_report.json
+
+
+七、项目报告中建议强调
+
+1. 没有使用 VLMEvalKit / OpenCompass / lm-evaluation-harness。
+2. 评测逻辑是手写的，包括答案解析、数字归一化、选项匹配和 Accuracy。
+3. 保存 raw response，方便复查 CoT 和解析失败。
+4. 通过 bad cases 区分模型错误和 parser 错误。
+5. verifier 是进阶模块，属于 answer-level verifier，不夸大成完整 PRM。
+
+
+八、Self-consistency N=4
+
+Self-consistency 会对每道题生成多个候选答案，然后对解析后的最终答案进行多数投票。
+
+MathVision-testmini:
+
+python scripts/run_self_consistency.py ^
+  --input data/processed/mathvision_testmini.jsonl ^
+  --output outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl ^
+  --candidates-output outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl ^
+  --n 4 ^
+  --temperature 0.7 ^
+  --top-p 0.9 ^
+  --batch-size 1
+
+python scripts/run_eval.py ^
+  --predictions outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl ^
+  --report outputs/eval_reports/mathvision_self_consistency_n4_report.json ^
+  --bad-cases outputs/eval_reports/mathvision_self_consistency_n4_bad_cases.jsonl
+
+V*Bench:
+
+python scripts/run_self_consistency.py ^
+  --input data/processed/vstar_bench.jsonl ^
+  --output outputs/predictions/vstar_self_consistency_n4_predictions.jsonl ^
+  --candidates-output outputs/predictions/vstar_self_consistency_n4_candidates.jsonl ^
+  --n 4 ^
+  --temperature 0.7 ^
+  --top-p 0.9 ^
+  --batch-size 1
+
+python scripts/run_eval.py ^
+  --predictions outputs/predictions/vstar_self_consistency_n4_predictions.jsonl ^
+  --report outputs/eval_reports/vstar_self_consistency_n4_report.json ^
+  --bad-cases outputs/eval_reports/vstar_self_consistency_n4_bad_cases.jsonl
+
+
+九、最终推荐复现实验顺序
+
+本项目最终建议按下面顺序复现实验。Linux 服务器上请把 Windows 的换行符 ^ 换成 \。
+
+1. 准备真实数据
+
+python scripts/prepare_real_datasets.py \
+  --dataset mathvision_testmini \
+  --output data/processed/mathvision_testmini.jsonl
+
+python scripts/prepare_real_datasets.py \
+  --dataset vstar_bench \
+  --output data/processed/vstar_bench.jsonl
+
+2. 启动 Qwen2.5-VL-3B vLLM 服务
+
+vllm serve Qwen/Qwen2.5-VL-3B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --limit-mm-per-prompt '{"image":1,"video":0}'
+
+同时确认 configs/model.yaml 中：
+
+model:
+  name: Qwen/Qwen2.5-VL-3B-Instruct
+  backend: vllm
+  api_base: http://localhost:8000/v1
+  api_key: EMPTY
+
+3. 跑 greedy baseline
+
+MathVision-testmini:
+
+python scripts/run_inference.py \
+  --input data/processed/mathvision_testmini.jsonl \
+  --output outputs/predictions/mathvision_testmini_predictions.jsonl \
+  --batch-size 1
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/mathvision_testmini_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_testmini_report.json \
+  --bad-cases outputs/eval_reports/mathvision_testmini_bad_cases.jsonl
+
+V*Bench:
+
+python scripts/run_inference.py \
+  --input data/processed/vstar_bench.jsonl \
+  --output outputs/predictions/vstar_bench_predictions.jsonl \
+  --batch-size 1
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/vstar_bench_predictions.jsonl \
+  --report outputs/eval_reports/vstar_bench_report.json \
+  --bad-cases outputs/eval_reports/vstar_bench_bad_cases.jsonl
+
+4. 跑 Self-consistency N=4
+
+MathVision-testmini:
+
+python scripts/run_self_consistency.py \
+  --input data/processed/mathvision_testmini.jsonl \
+  --output outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl \
+  --candidates-output outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --n 4 \
+  --temperature 0.7 \
+  --top-p 0.9 \
+  --batch-size 1
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_self_consistency_n4_report.json \
+  --bad-cases outputs/eval_reports/mathvision_self_consistency_n4_bad_cases.jsonl
+
+V*Bench:
+
+python scripts/run_self_consistency.py \
+  --input data/processed/vstar_bench.jsonl \
+  --output outputs/predictions/vstar_self_consistency_n4_predictions.jsonl \
+  --candidates-output outputs/predictions/vstar_self_consistency_n4_candidates.jsonl \
+  --n 4 \
+  --temperature 0.7 \
+  --top-p 0.9 \
+  --batch-size 1
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/vstar_self_consistency_n4_predictions.jsonl \
+  --report outputs/eval_reports/vstar_self_consistency_n4_report.json \
+  --bad-cases outputs/eval_reports/vstar_self_consistency_n4_bad_cases.jsonl
+
+5. 分析 Oracle@4
+
+python scripts/analyze_candidates.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/mathvision_self_consistency_n4_candidates_report.json \
+  --details-output outputs/eval_reports/mathvision_self_consistency_n4_candidates_details.jsonl
+
+python scripts/analyze_candidates.py \
+  --candidates outputs/predictions/vstar_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/vstar_self_consistency_n4_candidates_report.json \
+  --details-output outputs/eval_reports/vstar_self_consistency_n4_candidates_details.jsonl
+
+6. 跑 verifier / reranker 探索
+
+Rule verifier:
+
+python scripts/rule_verifier_rerank.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --output outputs/predictions/mathvision_rule_verifier_n4_predictions.jsonl \
+  --scores-output outputs/eval_reports/mathvision_rule_verifier_n4_scores.jsonl
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/mathvision_rule_verifier_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_rule_verifier_n4_report.json \
+  --bad-cases outputs/eval_reports/mathvision_rule_verifier_n4_bad_cases.jsonl
+
+Learned DistilBERT verifier:
+
+python scripts/build_verifier_data.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --train-output outputs/verifier/mathvision_n4_train.jsonl \
+  --valid-output outputs/verifier/mathvision_n4_valid.jsonl \
+  --valid-ratio 0.2
+
+python scripts/train_verifier.py \
+  --config configs/verifier_mathvision_n4.yaml
+
+python scripts/score_with_verifier.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --verifier-dir outputs/verifier/mathvision_n4_checkpoints \
+  --output outputs/predictions/mathvision_trained_verifier_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_trained_verifier_n4_report.json \
+  --scores-output outputs/eval_reports/mathvision_trained_verifier_n4_scores.jsonl \
+  --report-subset-ids-from outputs/verifier/mathvision_n4_valid.jsonl \
+  --batch-size 16
+
+MLLM-as-Verifier:
+
+python scripts/mllm_verifier_rerank.py \
+  --model-config configs/model.yaml \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --output outputs/predictions/mathvision_mllm_verifier_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_mllm_verifier_n4_report.json \
+  --judge-output outputs/eval_reports/mathvision_mllm_verifier_n4_judge.jsonl
+
+7. 做 bad case analysis
+
+python scripts/summarize_bad_cases.py \
+  --predictions outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/mathvision_bad_case_summary.json \
+  --samples-output outputs/eval_reports/mathvision_bad_case_samples.jsonl \
+  --max-samples-per-category 8
+
+python scripts/summarize_bad_cases.py \
+  --predictions outputs/predictions/vstar_bench_predictions.jsonl \
+  --candidates outputs/predictions/vstar_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/vstar_bad_case_summary.json \
+  --samples-output outputs/eval_reports/vstar_bad_case_samples.jsonl \
+  --max-samples-per-category 8
+
+
+十、最终结果摘要
+
+最终建议在报告中使用以下主结果：
+
+1. MathVision-testmini
+- Greedy baseline: 12.50%
+- Prompt v2: 12.17%
+- Self-consistency N=4 majority: 21.38%
+- Rule verifier rerank: 21.05%
+- DistilBERT learned verifier valid subset: 21.67%
+- MLLM-as-Verifier: 17.43%
+- Oracle@4: 39.80%
+
+2. V*Bench
+- Greedy baseline: 74.87%
+- Self-consistency N=4 majority: 71.73%
+- Oracle@4: 87.43%
+
+最终推荐主方法：
+- MathVision-testmini 使用 Self-consistency N=4 majority，Accuracy 21.38%。
+- V*Bench 使用 Greedy baseline，Accuracy 74.87%。
+- Verifier/RM Design 作为进阶探索呈现：当前轻量 verifier 没有稳定超过 majority，但 Oracle@4 显示 verifier 仍有明显潜在空间。
+
+
+十一、最终交付文件建议
+
+核心代码：
+- src/aibox_project_a/data/
+- src/aibox_project_a/prompts/
+- src/aibox_project_a/inference/
+- src/aibox_project_a/eval/
+- src/aibox_project_a/verifier/
+- scripts/
+
+配置文件：
+- configs/model.yaml
+- configs/eval.yaml
+- configs/eval_mathvision_testmini.yaml
+- configs/eval_vstar_bench.yaml
+- configs/verifier.yaml
+- configs/verifier_mathvision_n4.yaml
+
+实验产物：
+- outputs/predictions/
+- outputs/eval_reports/
+- outputs/verifier/
+
+说明与记录：
+- 运行说明.txt
+- 实验记录.txt
+- 知识学习/项目A基础知识学习清单.txt
+- 知识学习/LLaVA论文入门总结.txt

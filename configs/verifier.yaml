@@ -1,0 +1,14 @@
+data:
+  train_path: outputs/verifier/verifier_train.jsonl
+  valid_path: outputs/verifier/verifier_valid.jsonl
+
+model:
+  base_model: distilbert-base-uncased
+  output_dir: outputs/verifier/checkpoints
+
+training:
+  max_length: 512
+  batch_size: 8
+  learning_rate: 2.0e-5
+  epochs: 3
+  seed: 42

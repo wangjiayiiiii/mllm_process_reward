@@ -1,0 +1,653 @@
+项目A实验记录
+
+记录原则：
+- 每次更换方法、prompt、模型、评测逻辑或 verifier 设计后，都在这里追加一条记录。
+- 记录内容包括：方法、模型、数据集、推理设置、Accuracy、Parse Success Rate、耗时、结论。
+- 这里的结果用于后续报告/PPT 中的方法对比和 bad case 分析。
+
+
+实验 01：Greedy baseline，原始 prompt
+
+时间：
+- 当前阶段第一次完整 baseline。
+
+模型：
+- Qwen2.5-VL-3B-Instruct
+
+方法：
+- Greedy baseline
+- 每道题推理 1 次
+- 使用原始 prompt
+- temperature = 0.0
+- 直接解析 Final Answer，与 Ground Truth 匹配
+
+数据集与结果：
+
+1. MathVision-testmini
+- 样本数：304
+- Correct：38
+- Accuracy：0.1250
+- Parse Success Rate：1.0000
+- 推理耗时：约 15 分 54 秒
+- 平均速度：约 3.14 秒 / 样本
+
+2. V*Bench
+- 样本数：191
+- Correct：143
+- Accuracy：0.7487
+- Parse Success Rate：1.0000
+- 说明：最初由于没有把选项文本映射回 A/B/C/D，Accuracy 只有 0.0052；修复选项文本匹配后为 0.7487。
+
+结论：
+- 当前 Evaluation Pipeline 可用，parse_success_rate 为 1.0。
+- V*Bench 结果较好，说明视觉选择题链路有效。
+- MathVision-testmini 结果较低，主要瓶颈更可能是 3B 模型的视觉数学推理能力，而非评测脚本。
+
+
+实验 02：Prompt v2，强化视觉检查与计算验证
+
+模型：
+- Qwen2.5-VL-3B-Instruct
+
+方法：
+- Greedy baseline
+- 每道题推理 1 次
+- 使用 prompt v2
+- prompt v2 增加了以下约束：
+  - 先仔细检查图像
+  - 不要编造不可见的对象、行、标签或测量值
+  - counting 题只数可见相关对象并复查
+  - arithmetic / geometry / chart / table 题写关键计算并验证
+  - 有选项时最终答案必须是选项字母
+  - 无选项时最终答案尽量短且可比较
+
+数据集与结果：
+
+1. MathVision-testmini
+- 样本数：304
+- Correct：37
+- Accuracy：0.1217
+- Parse Success Rate：1.0000
+- 推理耗时：约 23 分 31 秒
+- 平均速度：约 4.64 秒 / 样本
+
+结论：
+- prompt v2 没有提升 MathVision-testmini，反而略低于原始 prompt。
+- 可能原因：
+  - Qwen2.5-VL-3B 对复杂视觉数学推理能力有限。
+  - 更长、更复杂的 prompt 增加了推理成本，但模型未必能稳定执行这些细化指令。
+- 后续不再继续堆叠 prompt，转向 Self-consistency / best-of-N。
+
+
+下一步计划：Self-consistency N=4
+
+目标：
+- 同一道题生成 4 个候选答案。
+- 分别解析最终答案。
+- 对归一化答案做多数投票。
+- 如果多数投票并列，使用简单规则打破平局。
+- 对比 Greedy baseline 与 Self-consistency N=4 的 Accuracy。
+
+实现状态：
+- 已新增脚本：scripts/run_self_consistency.py
+- 已通过 tiny mock 数据测试。
+- 输出两个文件：
+  - candidates-output：保存每道题的全部候选答案和 vote_key
+  - output：保存多数投票后的最终答案
+
+待运行命令：
+
+MathVision-testmini:
+python scripts/run_self_consistency.py \
+  --input data/processed/mathvision_testmini.jsonl \
+  --output outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl \
+  --candidates-output outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --n 4 \
+  --temperature 0.7 \
+  --top-p 0.9 \
+  --batch-size 1
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_self_consistency_n4_report.json \
+  --bad-cases outputs/eval_reports/mathvision_self_consistency_n4_bad_cases.jsonl
+
+
+实验 03：Self-consistency N=4
+
+模型：
+- Qwen2.5-VL-3B-Instruct
+
+方法：
+- Self-consistency
+- 每道题生成 4 个候选答案
+- 对每个候选解析最终答案
+- 对归一化答案做多数投票
+- 不训练 verifier
+
+数据集与结果：
+
+1. MathVision-testmini
+- 样本数：304
+- Correct：65
+- Accuracy：0.2138
+- Parse Success Rate：1.0000
+- 推理耗时：约 1 小时 44 分 58 秒
+- 平均速度：约 5.18 秒 / batch，共 1216 次候选推理
+
+对比：
+- Greedy baseline：0.1250
+- Prompt v2 greedy：0.1217
+- Self-consistency N=4：0.2138
+
+结论：
+- Self-consistency 明显提升 MathVision-testmini，说明模型在多次采样中能够偶尔生成正确候选。
+- 该方法主要属于 test-time scaling，用更多推理次数换取更稳的答案。
+- 下一步应分析 oracle@4：如果 4 个候选中至少有一个正确的比例明显高于 0.2138，则说明还有 rerank/verifier 提升空间。
+
+
+下一步分析：Candidates oracle@4
+
+目的：
+- 判断 4 个候选中是否存在更多正确答案。
+- 如果 oracle@4 明显高于 majority/self-consistency accuracy，说明 verifier/rerank 有提升空间。
+- 如果 oracle@4 接近 self-consistency accuracy，说明候选质量本身不足，继续 rerank 的收益有限。
+
+实现状态：
+- 已新增脚本：scripts/analyze_candidates.py
+
+待运行命令：
+
+python scripts/analyze_candidates.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/mathvision_self_consistency_n4_candidates_report.json \
+  --details-output outputs/eval_reports/mathvision_self_consistency_n4_candidates_details.jsonl
+
+运行结果：
+- Total：304
+- Candidates per sample：4
+- Oracle correct：121
+- Oracle@4：0.3980
+- Majority correct：65
+- Majority Accuracy：0.2138
+- Oracle-Majority Gap：0.1842
+- Oracle not majority：56
+- Diverse answer samples：296
+- Diverse answer rate：0.9737
+- Avg unique answers：3.2533
+- Avg consensus rate：0.4268
+
+结论：
+- 4 个候选中至少存在一个正确答案的比例达到 39.80%，明显高于多数投票的 21.38%。
+- 说明候选集合中包含大量可被 verifier/reranker 挑出来的正确答案。
+- oracle-majority gap 为 18.42%，证明接下来做 rule verifier 或 trained verifier 是有意义的。
+- 候选答案多样性很高，平均每题有 3.25 种不同答案，多数投票并不稳定，不能充分利用候选质量。
+
+
+下一步实验：Rule verifier rerank N=4
+
+目的：
+- 基于 self-consistency 的 4 个候选答案，设计无需训练的轻量 verifier。
+- verifier 对每个候选进行规则打分，再选择分数最高的候选作为最终答案。
+- 对比 majority voting 与 rule verifier rerank 的 Accuracy。
+
+规则打分信号：
+- parsed_answer 是否存在。
+- raw_response 是否包含 Final Answer。
+- 最终答案格式是否合法。
+- 候选答案是否获得其他候选支持。
+- 推理过程长度是否过短。
+- 是否出现 cannot determine / unclear 等不确定表达。
+- 数值答案是否出现在推理末尾的计算附近。
+
+实现状态：
+- 已新增脚本：scripts/rule_verifier_rerank.py
+- 已通过 tiny mock 数据测试。
+
+待运行命令：
+
+python scripts/rule_verifier_rerank.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --output outputs/predictions/mathvision_rule_verifier_n4_predictions.jsonl \
+  --scores-output outputs/eval_reports/mathvision_rule_verifier_n4_scores.jsonl
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/mathvision_rule_verifier_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_rule_verifier_n4_report.json \
+  --bad-cases outputs/eval_reports/mathvision_rule_verifier_n4_bad_cases.jsonl
+
+
+实验结果：
+- total: 304
+- correct: 64
+- accuracy: 21.05%
+- parse_success_rate: 100%
+
+对比：
+- Single deterministic baseline: 12.50%
+- Self-consistency majority voting N=4: 21.38%
+- Rule verifier rerank N=4: 21.05%
+- Oracle@4: 39.80%
+
+结论：
+- 当前 rule verifier 没有超过 majority voting，说明这些简单规则不能可靠地区分正确候选。
+- 但 Oracle@4 仍然很高，说明候选集合里有足够多正确答案，问题主要在“选择器”不够强。
+- 下一步应从手写规则转向 learned verifier，训练一个 answer-level verifier/reranker。
+
+
+下一步实验：Learned answer-level verifier
+
+目的：
+- 从 self-consistency N=4 candidates 构造 verifier 训练数据。
+- 每个候选作为一个训练样本，label=1 表示候选答案与 ground truth 匹配，label=0 表示错误。
+- 训练一个轻量 sequence classification 模型，对候选答案打分。
+- 用 trained verifier 从每道题的 4 个候选中选择最高分答案。
+
+实现状态：
+- build_verifier_data.py 已支持直接读取 candidates 并自动标注正负样本。
+- train_verifier.py 已加入 class weight，缓解正确候选较少导致的类别不平衡问题。
+- score_with_verifier.py 已支持 GPU 批量打分和保存候选分数。
+- 已新增配置：configs/verifier_mathvision_n4.yaml
+
+待运行命令：
+
+python scripts/build_verifier_data.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --train-output outputs/verifier/mathvision_n4_train.jsonl \
+  --valid-output outputs/verifier/mathvision_n4_valid.jsonl \
+  --valid-ratio 0.2
+
+python scripts/train_verifier.py \
+  --config configs/verifier_mathvision_n4.yaml
+
+python scripts/score_with_verifier.py \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --verifier-dir outputs/verifier/mathvision_n4_checkpoints \
+  --output outputs/predictions/mathvision_trained_verifier_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_trained_verifier_n4_report.json \
+  --scores-output outputs/eval_reports/mathvision_trained_verifier_n4_scores.jsonl \
+  --report-subset-ids-from outputs/verifier/mathvision_n4_valid.jsonl \
+  --batch-size 16
+
+注意：
+- trained verifier 的主报告建议看 valid subset，因为训练数据来自同一个 MathVision-testmini candidates 文件。
+- 如果对全部 304 题报准确率，会包含训练题目，结果会偏乐观。
+
+
+下一步实验：MLLM-as-Verifier / Qwen Judge Rerank
+
+背景：
+- Rule verifier rerank 没有超过 majority voting。
+- DistilBERT learned verifier 只能看文本，不能看图，难以判断 MathVision 的视觉证据。
+- Oracle@4 为 39.80%，说明候选集合里仍然有较大选择空间。
+
+方法：
+- 不重新生成候选答案，直接读取 self-consistency N=4 candidates。
+- 对每道题，把原图、题目和 4 个候选答案一起交给 Qwen2.5-VL。
+- 要求 Qwen2.5-VL 不输出新答案，只选择 Candidate A/B/C/D 中最可靠的一个。
+- 这是一个 MLLM-as-Verifier / MLLM-as-Judge reranker，不需要训练。
+
+实现状态：
+- 已新增脚本：scripts/mllm_verifier_rerank.py
+- 已通过本地编译检查和 linter 检查。
+
+建议先小样本测试：
+
+python scripts/mllm_verifier_rerank.py \
+  --model-config configs/model.yaml \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --output outputs/predictions/mathvision_mllm_verifier_n4_20_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_mllm_verifier_n4_20_report.json \
+  --judge-output outputs/eval_reports/mathvision_mllm_verifier_n4_20_judge.jsonl \
+  --limit 20
+
+完整运行命令：
+
+python scripts/mllm_verifier_rerank.py \
+  --model-config configs/model.yaml \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --output outputs/predictions/mathvision_mllm_verifier_n4_predictions.jsonl \
+  --report outputs/eval_reports/mathvision_mllm_verifier_n4_report.json \
+  --judge-output outputs/eval_reports/mathvision_mllm_verifier_n4_judge.jsonl
+
+预期：
+- 该方法需要 304 次 judge 请求，远少于 self-consistency N=4 的 1216 次生成请求。
+- 如果准确率超过 21.38%，说明视觉 verifier 能比多数投票更好地利用候选集合。
+- 如果仍然没有提升，可以在报告中说明：3B 模型同时承担生成器和 verifier 时，选择能力仍然有限。
+
+实验结果：
+- 小样本 20 题：accuracy 5.00%，parse_success_rate 100%
+- 完整 304 题：accuracy 17.43%，parse_success_rate 100%
+
+对比：
+- Self-consistency majority voting N=4: 21.38%
+- Rule verifier rerank N=4: 21.05%
+- DistilBERT learned verifier valid subset: 21.67%
+- MLLM-as-Verifier / Qwen Judge Rerank: 17.43%
+- Oracle@4: 39.80%
+
+结论：
+- 当前 Qwen2.5-VL-3B 作为 judge/reranker 没有带来提升，反而低于多数投票。
+- 说明同一个 3B 模型既作为生成器又作为 verifier 时，候选选择能力不足。
+- 这也进一步证明：多数投票是当前最稳健的免训练方法；要继续提升，需要更强 verifier、更大模型，或额外训练数据。
+
+
+V*Bench self-consistency N=4 实验
+
+命令：
+python scripts/run_self_consistency.py \
+  --input data/processed/vstar_bench.jsonl \
+  --output outputs/predictions/vstar_self_consistency_n4_predictions.jsonl \
+  --candidates-output outputs/predictions/vstar_self_consistency_n4_candidates.jsonl \
+  --n 4 \
+  --batch-size 1
+
+python scripts/run_eval.py \
+  --predictions outputs/predictions/vstar_self_consistency_n4_predictions.jsonl \
+  --report outputs/eval_reports/vstar_self_consistency_n4_report.json \
+  --bad-cases outputs/eval_reports/vstar_self_consistency_n4_bad_cases.jsonl
+
+python scripts/analyze_candidates.py \
+  --candidates outputs/predictions/vstar_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/vstar_self_consistency_n4_candidates_report.json \
+  --details-output outputs/eval_reports/vstar_self_consistency_n4_candidates_details.jsonl
+
+结果：
+- total: 191
+- Self-consistency majority correct: 137
+- Self-consistency majority accuracy: 71.73%
+- parse_success_rate: 100%
+- Oracle@4 correct: 167
+- Oracle@4: 87.43%
+- oracle_majority_gap: 15.71%
+- diverse_answer_rate: 62.83%
+- avg_unique_answers: 1.83
+- avg_consensus_rate: 76.83%
+
+对比：
+- V*Bench single baseline: 74.87%
+- V*Bench self-consistency N=4 majority: 71.73%
+- V*Bench Oracle@4: 87.43%
+
+结论：
+- V*Bench 上 self-consistency majority voting 低于单次 baseline，说明采样带来的错误候选会干扰多数投票。
+- 但 Oracle@4 达到 87.43%，说明 4 个候选中经常包含正确答案。
+- V*Bench 的核心瓶颈同样不是候选生成，而是候选选择；不过 majority voting 不适合该数据集。
+
+
+阶段性总实验表
+
+模型：
+- Qwen2.5-VL-3B-Instruct
+
+主结果汇总：
+
+| 数据集 | 方法 | 样本数 | Correct | Accuracy | Parse Success Rate | 备注 |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| MathVision-testmini | Greedy baseline | 304 | 38 | 12.50% | 100% | 原始 prompt，temperature=0 |
+| MathVision-testmini | Prompt v2 | 304 | 37 | 12.17% | 100% | 强化视觉检查与计算验证，但未提升 |
+| MathVision-testmini | Self-consistency N=4 majority | 304 | 65 | 21.38% | 100% | 当前 MathVision 最优主结果 |
+| MathVision-testmini | Rule verifier rerank N=4 | 304 | 64 | 21.05% | 100% | 无训练规则打分，未超过 majority |
+| MathVision-testmini | DistilBERT learned verifier | 60 valid questions | 13 | 21.67% | 100% | 只看 valid subset，文本 verifier 看不到图 |
+| MathVision-testmini | MLLM-as-Verifier / Qwen judge | 304 | 53 | 17.43% | 100% | 3B judge 未超过 majority |
+| MathVision-testmini | Oracle@4 | 304 | 121 | 39.80% | - | 4 个候选中只要有一个正确即算对，表示 rerank 上限 |
+| V*Bench | Greedy baseline | 191 | 143 | 74.87% | 100% | 修复选项文本匹配后的 baseline |
+| V*Bench | Self-consistency N=4 majority | 191 | 137 | 71.73% | 100% | 低于 single baseline |
+| V*Bench | Oracle@4 | 191 | 167 | 87.43% | - | 候选集合上限很高 |
+
+核心发现：
+- Evaluation Pipeline 稳定：两个数据集 parse_success_rate 均为 100%，说明答案解析和评测链路可靠。
+- MathVision 更依赖复杂视觉数学推理，3B greedy baseline 较低；self-consistency N=4 从 12.50% 提升到 21.38%，说明 test-time scaling 有效。
+- V*Bench greedy baseline 已较高，self-consistency majority 反而下降，说明采样候选会引入噪声，多数投票并不总是有效。
+- 两个数据集的 Oracle@4 都明显高于 majority 结果：MathVision 为 39.80%，V*Bench 为 87.43%。这说明“生成多个候选”本身有潜力，真正瓶颈是 verifier/reranker 的选择能力。
+- 当前尝试过的 rule verifier、DistilBERT learned verifier、Qwen2.5-VL-3B judge 都没有稳定超过 majority voting，说明轻量规则或同等规模 3B verifier 不足以可靠选择正确候选。
+
+当前推荐主结论：
+- 对 MathVision-testmini，最终主方法采用 Self-consistency N=4 majority，Accuracy 21.38%。
+- 对 V*Bench，最终主方法采用 Greedy baseline，Accuracy 74.87%。
+- Verifier/RM Design 部分作为进阶探索呈现：虽然未带来稳定提升，但通过 Oracle@4 分析证明了 verifier 的潜在价值，并定位了当前瓶颈。
+
+下一步：
+- 做 bad case analysis。
+- 从 MathVision 和 V*Bench 各挑选典型失败样本，分析错误来源。
+- 建议类别：图像理解错误、计数错误、几何/数值计算错误、候选多数投票选错、verifier/reranker 选错。
+
+
+Bad case analysis 计划
+
+目的：
+- 对最终主结果中的错误样本进行归因。
+- 区分“候选生成失败”和“候选选择失败”。
+- 为报告中的案例分析提供可复核样本。
+
+实现状态：
+- 已新增脚本：scripts/summarize_bad_cases.py
+- 已通过编译检查和 linter 检查。
+
+MathVision-testmini bad case 分析命令：
+
+python scripts/summarize_bad_cases.py \
+  --predictions outputs/predictions/mathvision_self_consistency_n4_predictions.jsonl \
+  --candidates outputs/predictions/mathvision_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/mathvision_bad_case_summary.json \
+  --samples-output outputs/eval_reports/mathvision_bad_case_samples.jsonl \
+  --max-samples-per-category 8
+
+V*Bench bad case 分析命令：
+
+python scripts/summarize_bad_cases.py \
+  --predictions outputs/predictions/vstar_bench_predictions.jsonl \
+  --candidates outputs/predictions/vstar_self_consistency_n4_candidates.jsonl \
+  --report outputs/eval_reports/vstar_bad_case_summary.json \
+  --samples-output outputs/eval_reports/vstar_bad_case_samples.jsonl \
+  --max-samples-per-category 8
+
+说明：
+- category = reranker_or_voting_failure 表示候选中至少有一个正确答案，但最终选择错了。
+- category = candidate_generation_failure 表示 4 个候选都没有正确答案。
+- problem_type 是基于问题文本的粗粒度类型，如 counting、geometry_or_measurement、chart_or_table、ocr_or_text_reading 等。
+
+运行结果：
+
+1. MathVision-testmini
+- total_predictions: 304
+- bad_cases: 239
+- bad_case_rate: 78.62%
+- category_counts:
+  - candidate_generation_failure: 183
+  - reranker_or_voting_failure: 56
+- problem_type_counts:
+  - counting: 73
+  - geometry_or_measurement: 66
+  - multiple_choice_visual_reasoning: 46
+  - ocr_or_text_reading: 25
+  - chart_or_table: 20
+  - open_visual_reasoning: 9
+- sampled_cases: 16
+
+2. V*Bench
+- total_predictions: 191
+- bad_cases: 48
+- bad_case_rate: 25.13%
+- category_counts:
+  - candidate_generation_failure: 18
+  - reranker_or_voting_failure: 30
+- problem_type_counts:
+  - multiple_choice_visual_reasoning: 48
+- sampled_cases: 16
+
+结论：
+- MathVision 的主要错误来源是 candidate_generation_failure，说明 3B 模型在多数错误题上没有生成任何正确候选，核心瓶颈仍是复杂视觉数学推理能力。
+- MathVision 中也有 56 个 reranker_or_voting_failure，说明 verifier/reranker 仍有可提升空间。
+- V*Bench 的错误更偏向 reranker_or_voting_failure，30/48 个错误样本中候选集合存在正确答案，但最终 baseline 或投票选择错了。
+- 这进一步支持前面的结论：V*Bench 的候选生成能力较强，瓶颈主要是候选选择；MathVision 则同时受生成能力和选择能力限制。
+
+
+Qualitative bad case 选例
+
+选例原则：
+- MathVision 选择 candidate_generation_failure 样本，说明复杂视觉数学题中 3B 模型经常连正确候选都生成不出。
+- V*Bench 选择 reranker_or_voting_failure 样本，说明候选中已有正确答案，但最终选择器没有选中。
+
+推荐写入报告的案例：
+
+1. MathVision id=4
+- 题目：How many different digits can you find in this picture?
+- Ground Truth: 6
+- 模型最终答案：2
+- 错误类别：candidate_generation_failure
+- 题型：counting / OCR-like counting
+- 候选情况：4 个候选均错误，分别偏向 2、3、0 或无效答案。
+- 分析：模型未能稳定识别图中所有不同数字，说明视觉细节识别和计数能力不足。
+
+2. MathVision id=8
+- 题目：The sums of the all the three numbers on each side of the triangle are equal. Two numbers happened to be stained with ink. How much is the sum of these two numbers?
+- Ground Truth: 2
+- 模型最终答案：3 或其他错误表达
+- 错误类别：candidate_generation_failure
+- 题型：geometry / arithmetic visual reasoning
+- 候选情况：候选答案出现 3、10、8 或无法确定，均不正确。
+- 分析：模型没有正确建立三角形边上数字和相等的约束关系，属于视觉结构理解与符号推理结合失败。
+
+3. MathVision id=10
+- 题目：Four people can be seated at a square table. How many people at most could be seated if we pushed four tables of this kind together in one row?
+- Ground Truth: 10
+- 模型候选答案：20、8、24 等
+- 错误类别：candidate_generation_failure
+- 题型：arrangement counting
+- 候选情况：4 个候选均错误。
+- 分析：模型倾向于把每张桌子可坐人数直接相加，忽略桌子拼接后相邻边不能坐人的空间约束。
+
+4. MathVision id=11
+- 题目：Mike has built a construction ... How many cubes has Lily taken?
+- Ground Truth: 7
+- 模型候选答案：18、16 或无效推理
+- 错误类别：candidate_generation_failure
+- 题型：solid geometry / cube counting
+- 候选情况：4 个候选均错误。
+- 分析：模型难以对上下两幅立方体结构进行三维对应和差分计数。
+
+5. V*Bench vstar_31
+- 题目：What is the color of the telephone?
+- Choices: A green, B white, C orange, D blue
+- Ground Truth: C
+- 模型最终答案：B
+- 错误类别：reranker_or_voting_failure
+- 候选情况：candidate 2 预测 C 且正确，但最终选择了错误答案 B。
+- 分析：该样本说明候选集合中已经包含正确答案，但当前投票/选择机制没有选中它，体现 V*Bench 的主要瓶颈在 reranking。
+
+6. V*Bench vstar_44
+- 题目：What is the color of the toothbrush?
+- Choices: A green, B blue, C yellow, D red
+- Ground Truth: D
+- 模型最终答案：B
+- 错误类别：reranker_or_voting_failure
+- 候选情况：candidate 1 预测 D 且正确，但最终选择了错误答案 B。
+- 分析：该样本进一步说明 V*Bench 上多候选生成具有潜力，但需要更强 verifier/reranker 才能选出正确候选。
+
+报告中的整体表述：
+- MathVision bad cases show that Qwen2.5-VL-3B often fails to generate any correct candidate for complex visual math problems, especially counting, geometry, and spatial reasoning.
+- V*Bench bad cases show a different pattern: correct answers often appear among candidates, but the final selection mechanism fails to pick them.
+- Therefore, future improvement should follow different directions for different datasets: stronger base MLLMs for MathVision, and stronger verifier/reranker design for V*Bench.
+
+基于图片复核后的 qualitative analysis：
+
+1. MathVision id=4
+- 图片内容：猫形图案中隐藏/组成了多个数字，例如头部有 0、0、5，身体和尾巴等轮廓也构成数字。
+- 正确答案：6
+- 模型错误：候选集中只识别出 2、3 或局部数字，未能完整发现所有不同数字。
+- 复核结论：这是典型的视觉细节识别 + 计数失败。模型能看到局部数字，但不能系统扫描整幅图。
+
+2. MathVision id=8
+- 图片内容：三角形三个顶点/边上有数字 7、1、6、3，左右两个圆圈被墨水遮挡。题目要求在每条边三个数之和相等的条件下求两个遮挡数之和。
+- 正确答案：2
+- 模型错误：候选给出 3、8、10 或无法确定。
+- 复核结论：模型没有正确利用“三条边和相等”的全局约束，属于视觉结构解析与代数约束推理失败。
+
+3. MathVision id=10
+- 图片内容：一张方桌四边各可坐一人，题目问四张同类桌子排成一行最多可坐多少人。
+- 正确答案：10
+- 模型错误：候选出现 20、8、24 等。
+- 复核结论：模型把单桌座位数直接相加或错误累加，忽略了桌子拼接后内部相邻边不能坐人的空间约束。这是组合计数和空间关系建模失败。
+
+4. MathVision id=11
+- 图片内容：上图是完整长方体积木结构，下图是移走若干立方体后的结构，需要比较两图求被拿走的立方体数量。
+- 正确答案：7
+- 模型错误：候选出现 18、16 或无效描述。
+- 复核结论：模型难以把上下两个三维结构对齐并做差分计数，属于 solid geometry / cube counting 失败。
+
+5. V*Bench vstar_31
+- 图片内容：街景中目标物体较小，telephone 不明显，需要在复杂背景中定位目标并判断颜色。
+- 正确答案：C / orange
+- 模型最终错误：B / white
+- 候选情况：candidate 2 已给出正确答案 C，但最终没有选中。
+- 复核结论：该样本适合说明 V*Bench 的 reranker/voting failure：候选集中已有正确答案，但选择机制失败。同时，该图也说明小目标定位会增加选择难度。
+
+6. V*Bench vstar_44
+- 图片内容：牙科诊室全景图，牙刷/相关目标很小，背景物体多且存在强光、白色墙面和绿色柜体干扰。
+- 正确答案：D / red
+- 模型最终错误：B / blue
+- 候选情况：candidate 1 已给出正确答案 D，但最终没有选中。
+- 复核结论：这是另一个典型 reranker/voting failure。模型某次采样能答对，但多数投票或选择器偏向了错误颜色，说明候选选择仍是 V*Bench 的关键瓶颈。
+
+
+最终报告大纲建议
+
+1. 项目目标
+- 构建一个面向 MLLM 复杂视觉推理任务的 evaluation pipeline。
+- 覆盖数据处理、模型推理、答案解析、指标计算、bad case 分析和 verifier/reranker 探索。
+- 数据集使用 MathVision-testmini 和 V*Bench。
+
+2. 方法设计
+- 数据统一为 JSONL schema：id、question、choices、answer、image_path、dataset、metadata。
+- 推理后保存 raw_response，保证可复查和可复现。
+- 评测模块手写实现，不依赖 VLMEvalKit / OpenCompass / lm-evaluation-harness。
+- 答案解析支持 Final Answer、boxed answer、选项 A/B/C/D、选项文本映射、数字归一化。
+
+3. Baseline
+- 模型：Qwen2.5-VL-3B-Instruct。
+- 推理方式：vLLM OpenAI-compatible API。
+- MathVision-testmini greedy baseline: 12.50%。
+- V*Bench greedy baseline: 74.87%。
+- 解析成功率均为 100%，说明评测链路稳定。
+
+4. Prompt 实验
+- Prompt v2 强化视觉检查、计数、计算验证和答案格式。
+- MathVision-testmini 从 12.50% 变为 12.17%，没有提升。
+- 结论：对 3B 模型，继续堆叠复杂 prompt 收益有限。
+
+5. Self-consistency / Test-time scaling
+- 每题采样 4 个候选，解析后多数投票。
+- MathVision-testmini 从 12.50% 提升到 21.38%。
+- V*Bench 从 74.87% 下降到 71.73%。
+- 结论：Self-consistency 对复杂数学推理有效，但对已较稳定的选择题可能引入噪声。
+
+6. Oracle@4 分析
+- MathVision Oracle@4: 39.80%，高于 majority 21.38%。
+- V*Bench Oracle@4: 87.43%，高于 majority 71.73%。
+- 结论：多候选生成具有潜力，瓶颈在 verifier/reranker 选择能力。
+
+7. Verifier/RM Design 探索
+- Rule verifier: 21.05%，未超过 MathVision majority。
+- DistilBERT learned verifier valid subset: 21.67%，提升有限，且无法看图。
+- MLLM-as-Verifier / Qwen judge: 17.43%，低于 majority。
+- 结论：当前轻量规则、文本 verifier、同规模 3B judge 都不足以稳定选择正确候选。
+
+8. Bad case analysis
+- MathVision bad cases: 183 个 candidate_generation_failure，56 个 reranker_or_voting_failure。
+- V*Bench bad cases: 18 个 candidate_generation_failure，30 个 reranker_or_voting_failure。
+- 结论：MathVision 主要受生成能力限制；V*Bench 更受候选选择限制。
+- Qualitative cases: MathVision id=4/8/10/11，V*Bench vstar_31/vstar_44。
+
+9. 最终结论
+- Evaluation Pipeline 完整可靠，parse_success_rate 稳定为 100%。
+- MathVision 最终推荐结果：Self-consistency N=4 majority，21.38%。
+- V*Bench 最终推荐结果：Greedy baseline，74.87%。
+- Verifier/RM Design 的主要发现是：Oracle@4 显示 verifier 有潜力，但当前 3B/轻量 verifier 选择能力不足。
+
+10. 后续改进方向
+- 使用更强 MLLM 作为 generator 或 judge，例如 Qwen2.5-VL-7B/更大模型。
+- 增加 N 或引入更好的 candidate diversity 控制。
+- 训练可看图的 multimodal verifier，而不是纯文本 DistilBERT verifier。
+- 针对 MathVision 增强视觉数学推理能力，针对 V*Bench 优化 reranking。
+

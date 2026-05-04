@@ -1,0 +1,15 @@
+dataset:
+  name: mathvision
+  source: local
+  input_path: data/processed/mathvision_testmini.jsonl
+  image_root: data/raw/mathvision
+
+outputs:
+  predictions_path: outputs/predictions/mathvision_testmini_predictions.jsonl
+  report_path: outputs/eval_reports/mathvision_testmini_report.json
+  bad_cases_path: outputs/eval_reports/mathvision_testmini_bad_cases.jsonl
+
+evaluation:
+  answer_type: auto
+  numeric_tolerance: 1.0e-6
+  save_correct_cases: false

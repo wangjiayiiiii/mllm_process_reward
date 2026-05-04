@@ -1,0 +1,15 @@
+dataset:
+  name: vstar_bench
+  source: local
+  input_path: data/processed/vstar_bench.jsonl
+  image_root: data/raw/vstar_bench
+
+outputs:
+  predictions_path: outputs/predictions/vstar_bench_predictions.jsonl
+  report_path: outputs/eval_reports/vstar_bench_report.json
+  bad_cases_path: outputs/eval_reports/vstar_bench_bad_cases.jsonl
+
+evaluation:
+  answer_type: multiple_choice
+  numeric_tolerance: 1.0e-6
+  save_correct_cases: false

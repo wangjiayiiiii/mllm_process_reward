@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project A generated data and large artifacts
+data/raw/
+data/processed/
+outputs/
+zzz/
+*.zip
+*.pptx
+论文/
+
+# Local IDE and task materials
+.vscode/
+代码项目考核材料/

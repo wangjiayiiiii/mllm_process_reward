@@ -1,0 +1,14 @@
+datasets
+accelerate
+huggingface_hub
+jsonlines
+numpy
+openai
+pillow
+PyYAML
+scikit-learn
+torch
+tqdm
+transformers
+qwen-vl-utils
+vllm

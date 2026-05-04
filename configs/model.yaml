@@ -1,0 +1,18 @@
+model:
+  name: Qwen/Qwen2.5-VL-3B-Instruct
+  backend: mock
+  api_base: http://localhost:8000/v1
+  api_key: EMPTY
+
+generation:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 1024
+  n: 1
+
+vllm_server:
+  host: 0.0.0.0
+  port: 8000
+  extra_args:
+    - --limit-mm-per-prompt
+    - '{"image":1,"video":0}'

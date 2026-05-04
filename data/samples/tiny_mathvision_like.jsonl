@@ -1,0 +1,2 @@
+{"id":"demo_1","dataset":"demo","question":"What is 1/2 as a decimal?","choices":["0.25","0.5","1","2"],"answer":"B","image_path":null}
+{"id":"demo_2","dataset":"demo","question":"Compute 2 + 3. Put the final answer as a number.","answer":"5","image_path":null}
