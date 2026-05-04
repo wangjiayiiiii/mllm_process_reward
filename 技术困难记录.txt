@@ -1,0 +1,34 @@
+项目A技术困难记录
+
+1. 多选题答案匹配问题
+
+现象：
+- V*Bench 初次评测准确率异常偏低。
+- 检查 raw response 后发现，模型经常输出选项文本，例如 "rubber"、"white"，而 ground truth 是 A/B/C/D。
+- 如果只做简单字符串 exact match，会把本来语义正确的答案判为错误。
+
+解决：
+- 在 normalizer 中新增 option_label_from_text。
+- 支持把模型输出的选项文本映射回选项字母。
+- run_eval.py 和 verifier/reranker 评测中统一传入 choices，保证选择题评测一致。
+
+结果：
+- V*Bench 从接近 0 的异常结果恢复到 74.87%。
+- 说明评测流水线中的答案归一化和字段对齐非常关键。
+
+
+2. Verifier/Reranker 没有稳定提升
+
+现象：
+- MathVision self-consistency N=4 从 12.50% 提升到 21.38%。
+- Oracle@4 达到 39.80%，说明 4 个候选中经常有正确答案。
+- 但 rule verifier、DistilBERT learned verifier、Qwen2.5-VL-3B judge 都没有稳定超过 majority voting。
+
+分析：
+- Rule verifier 只能基于格式、投票支持度、推理长度等浅层特征，无法判断视觉证据是否正确。
+- DistilBERT verifier 是纯文本模型，看不到图片，难以判断 MathVision 中的视觉数学推理。
+- Qwen2.5-VL-3B 同时作为 generator 和 judge 时，候选选择能力仍然有限。
+
+结论：
+- 当前瓶颈不是 evaluation pipeline，而是 verifier/reranker 的选择能力。
+- 后续更合理的方向是训练可看图的 multimodal verifier，或使用更强的 MLLM 作为 judge。
